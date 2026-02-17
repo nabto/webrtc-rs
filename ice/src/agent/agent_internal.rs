@@ -5,8 +5,11 @@ use util::sync::Mutex as SyncMutex;
 
 use super::agent_transport::*;
 use super::*;
+use stun::error_code::*;
+
 use crate::candidate::candidate_base::CandidateBaseConfig;
 use crate::candidate::candidate_peer_reflexive::CandidatePeerReflexiveConfig;
+use crate::control::{AttrControlled, AttrControlling};
 use crate::util::*;
 
 pub type ChanCandidateTx =
@@ -769,6 +772,79 @@ impl AgentInternal {
         }
     }
 
+    /// Switches the ICE role (controlling <-> controlled) per RFC 8445 Section 7.3.1.1.
+    ///
+    /// Flips `is_controlling`, updates `ice_role_controlling` on all candidate pairs
+    /// in the checklist (which affects `CandidatePair::priority()`), and clears
+    /// `nominated_pair` (nominations are controlling-agent-only).
+    pub(crate) async fn switch_role(&self) {
+        let new_is_controlling = !self.is_controlling.load(Ordering::SeqCst);
+        self.is_controlling
+            .store(new_is_controlling, Ordering::SeqCst);
+
+        log::debug!(
+            "[{}]: Role switched to {}",
+            self.get_name(),
+            if new_is_controlling {
+                "controlling"
+            } else {
+                "controlled"
+            }
+        );
+
+        // Update all candidate pairs to reflect the new role
+        {
+            let checklist = self.agent_conn.checklist.lock().await;
+            for p in &*checklist {
+                p.ice_role_controlling
+                    .store(new_is_controlling, Ordering::SeqCst);
+            }
+        }
+
+        // Clear nominated pair — nominations are only valid for the controlling agent
+        {
+            let mut nominated_pair = self.nominated_pair.lock().await;
+            *nominated_pair = None;
+        }
+    }
+
+    /// Sends a STUN Binding Error Response with a 487 Role Conflict error code.
+    pub(crate) async fn send_binding_error_role_conflict(
+        &self,
+        m: &Message,
+        local: &Arc<dyn Candidate + Send + Sync>,
+        remote: &Arc<dyn Candidate + Send + Sync>,
+    ) {
+        let local_pwd = {
+            let ufrag_pwd = self.ufrag_pwd.lock().await;
+            ufrag_pwd.local_pwd.clone()
+        };
+
+        let (out, result) = {
+            let mut out = Message::new();
+            let result = out.build(&[
+                Box::new(m.clone()),
+                Box::new(BINDING_ERROR),
+                Box::new(CODE_ROLE_CONFLICT),
+                Box::new(MessageIntegrity::new_short_term_integrity(local_pwd)),
+                Box::new(FINGERPRINT),
+            ]);
+            (out, result)
+        };
+
+        if let Err(err) = result {
+            log::warn!(
+                "[{}]: Failed to build role conflict error response from: {} to: {} error: {}",
+                self.get_name(),
+                local,
+                remote,
+                err
+            );
+        } else {
+            self.send_stun(&out, local, remote).await;
+        }
+    }
+
     /// Removes pending binding requests that are over `maxBindingRequestTimeout` old Let HTO be the
     /// transaction timeout, which SHOULD be 2*RTT if RTT is known or 500 ms otherwise.
     ///
@@ -828,7 +904,8 @@ impl AgentInternal {
         if m.typ.method != METHOD_BINDING
             || !(m.typ.class == CLASS_SUCCESS_RESPONSE
                 || m.typ.class == CLASS_REQUEST
-                || m.typ.class == CLASS_INDICATION)
+                || m.typ.class == CLASS_INDICATION
+                || m.typ.class == CLASS_ERROR_RESPONSE)
         {
             log::trace!(
                 "[{}]: unhandled STUN from {} to {} class({}) method({})",
@@ -841,26 +918,89 @@ impl AgentInternal {
             return;
         }
 
-        if self.is_controlling.load(Ordering::SeqCst) {
-            if m.contains(ATTR_ICE_CONTROLLING) {
-                log::debug!(
-                    "[{}]: inbound isControlling && a.isControlling == true",
-                    self.get_name(),
-                );
-                return;
-            } else if m.contains(ATTR_USE_CANDIDATE) {
-                log::debug!(
-                    "[{}]: useCandidate && a.isControlling == true",
-                    self.get_name(),
-                );
-                return;
+        // Role conflict resolution per RFC 8445 Section 7.3.1.1.
+        // Only applies to binding requests (role attributes only appear in requests).
+        if m.typ.class == CLASS_REQUEST {
+            let local_tie_breaker = self.tie_breaker.load(Ordering::SeqCst);
+
+            if self.is_controlling.load(Ordering::SeqCst) {
+                if m.contains(ATTR_ICE_CONTROLLING) {
+                    // Both agents are CONTROLLING — Loss of communication would happen
+                    // without role conflict resolution.
+                    let mut remote_attr = AttrControlling::default();
+                    if let Err(err) = remote_attr.get_from(m) {
+                        log::warn!(
+                            "[{}]: Failed to parse ICE-CONTROLLING attribute: {}",
+                            self.get_name(),
+                            err
+                        );
+                        return;
+                    }
+                    let remote_tie_breaker = remote_attr.0;
+
+                    if local_tie_breaker >= remote_tie_breaker {
+                        // Local wins — send 487 error, keep CONTROLLING role
+                        log::debug!(
+                            "[{}]: Role conflict (both controlling): local wins, sending 487",
+                            self.get_name(),
+                        );
+                        let remote_candidate = self
+                            .find_remote_candidate(local.network_type(), remote)
+                            .await;
+                        if let Some(rc) = &remote_candidate {
+                            self.send_binding_error_role_conflict(m, local, rc).await;
+                        }
+                        return;
+                    } else {
+                        // Remote wins — switch to CONTROLLED, fall through to process request
+                        log::debug!(
+                            "[{}]: Role conflict (both controlling): remote wins, switching to controlled",
+                            self.get_name(),
+                        );
+                        self.switch_role().await;
+                    }
+                } else if m.contains(ATTR_USE_CANDIDATE) {
+                    log::debug!(
+                        "[{}]: useCandidate && a.isControlling == true",
+                        self.get_name(),
+                    );
+                    return;
+                }
+            } else if m.contains(ATTR_ICE_CONTROLLED) {
+                // Both agents are CONTROLLED
+                let mut remote_attr = AttrControlled::default();
+                if let Err(err) = remote_attr.get_from(m) {
+                    log::warn!(
+                        "[{}]: Failed to parse ICE-CONTROLLED attribute: {}",
+                        self.get_name(),
+                        err
+                    );
+                    return;
+                }
+                let remote_tie_breaker = remote_attr.0;
+
+                if local_tie_breaker >= remote_tie_breaker {
+                    // Local wins — switch to CONTROLLING, fall through to process request
+                    log::debug!(
+                        "[{}]: Role conflict (both controlled): local wins, switching to controlling",
+                        self.get_name(),
+                    );
+                    self.switch_role().await;
+                } else {
+                    // Remote wins — send 487 error, keep CONTROLLED role
+                    log::debug!(
+                        "[{}]: Role conflict (both controlled): remote wins, sending 487",
+                        self.get_name(),
+                    );
+                    let remote_candidate = self
+                        .find_remote_candidate(local.network_type(), remote)
+                        .await;
+                    if let Some(rc) = &remote_candidate {
+                        self.send_binding_error_role_conflict(m, local, rc).await;
+                    }
+                    return;
+                }
             }
-        } else if m.contains(ATTR_ICE_CONTROLLED) {
-            log::debug!(
-                "[{}]: inbound isControlled && a.isControlling == false",
-                self.get_name(),
-            );
-            return;
         }
 
         let mut remote_candidate = self
@@ -964,6 +1104,54 @@ impl AgentInternal {
 
             if let Some(rc) = &remote_candidate {
                 self.handle_binding_request(m, local, rc).await;
+            }
+        } else if m.typ.class == CLASS_ERROR_RESPONSE {
+            // Handle error responses — specifically 487 Role Conflict
+            {
+                let ufrag_pwd = self.ufrag_pwd.lock().await;
+                if let Err(err) =
+                    assert_inbound_message_integrity(m, ufrag_pwd.remote_pwd.as_bytes())
+                {
+                    log::warn!(
+                        "[{}]: discard error response from ({}), {}",
+                        self.get_name(),
+                        remote,
+                        err
+                    );
+                    return;
+                }
+            }
+
+            let mut error_attr = ErrorCodeAttribute::default();
+            if let Err(err) = error_attr.get_from(m) {
+                log::warn!(
+                    "[{}]: discard error response from ({}), failed to parse error code: {}",
+                    self.get_name(),
+                    remote,
+                    err
+                );
+                return;
+            }
+
+            if error_attr.code == CODE_ROLE_CONFLICT {
+                log::debug!(
+                    "[{}]: Received 487 Role Conflict from {}, switching role",
+                    self.get_name(),
+                    remote,
+                );
+
+                // Clean up the pending binding request so it can be retried
+                self.handle_inbound_binding_success(m.transaction_id).await;
+
+                // Switch our role
+                self.switch_role().await;
+            } else {
+                log::debug!(
+                    "[{}]: Received error response {} from {}",
+                    self.get_name(),
+                    error_attr,
+                    remote,
+                );
             }
         }
 

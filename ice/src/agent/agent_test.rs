@@ -17,7 +17,7 @@ use crate::candidate::candidate_host::*;
 use crate::candidate::candidate_peer_reflexive::*;
 use crate::candidate::candidate_relay::*;
 use crate::candidate::candidate_server_reflexive::*;
-use crate::control::AttrControlling;
+use crate::control::{AttrControlled, AttrControlling};
 use crate::priority::PriorityAttr;
 use crate::use_candidate::UseCandidateAttr;
 
@@ -2124,6 +2124,248 @@ async fn test_run_task_in_selected_candidate_pair_change_callback() -> Result<()
     a_agent.close().await?;
     b_agent.close().await?;
 
+    Ok(())
+}
+
+// RFC 8445 Section 7.3.1.1: Both agents are CONTROLLING, local tie-breaker >= remote.
+// Local keeps CONTROLLING role and sends 487 error.
+#[tokio::test]
+async fn test_role_conflict_both_controlling_local_wins() -> Result<()> {
+    let a = Agent::new(AgentConfig {
+        is_controlling: true,
+        ..Default::default()
+    })
+    .await?;
+
+    // Set a known tie-breaker: local=200, remote=100 → local wins
+    a.internal.tie_breaker.store(200, Ordering::SeqCst);
+
+    let local: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    let remote = SocketAddr::from_str("172.17.0.3:999")?;
+
+    let (username, local_pwd) = {
+        let ufrag_pwd = a.internal.ufrag_pwd.lock().await;
+        (
+            format!("{}:{}", ufrag_pwd.local_ufrag, ufrag_pwd.remote_ufrag),
+            ufrag_pwd.local_pwd.clone(),
+        )
+    };
+
+    // Build a BINDING REQUEST with ICE-CONTROLLING (conflict: both controlling)
+    let mut msg = Message::new();
+    msg.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username)),
+        Box::new(AttrControlling(100)), // remote tie-breaker = 100
+        Box::new(PriorityAttr(local.priority())),
+        Box::new(MessageIntegrity::new_short_term_integrity(local_pwd)),
+        Box::new(FINGERPRINT),
+    ])?;
+
+    a.internal.handle_inbound(&mut msg, &local, remote).await;
+
+    // Local should remain CONTROLLING (it won the tie-break)
+    assert!(
+        a.internal.is_controlling.load(Ordering::SeqCst),
+        "Agent should remain controlling when local tie-breaker >= remote"
+    );
+
+    a.close().await?;
+    Ok(())
+}
+
+// RFC 8445 Section 7.3.1.1: Both agents are CONTROLLING, local tie-breaker < remote.
+// Local switches to CONTROLLED.
+#[tokio::test]
+async fn test_role_conflict_both_controlling_remote_wins() -> Result<()> {
+    let a = Agent::new(AgentConfig {
+        is_controlling: true,
+        ..Default::default()
+    })
+    .await?;
+
+    // Set a known tie-breaker: local=100, remote=200 → remote wins
+    a.internal.tie_breaker.store(100, Ordering::SeqCst);
+
+    let local: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    let remote = SocketAddr::from_str("172.17.0.3:999")?;
+
+    let (username, local_pwd) = {
+        let ufrag_pwd = a.internal.ufrag_pwd.lock().await;
+        (
+            format!("{}:{}", ufrag_pwd.local_ufrag, ufrag_pwd.remote_ufrag),
+            ufrag_pwd.local_pwd.clone(),
+        )
+    };
+
+    // Build a BINDING REQUEST with ICE-CONTROLLING (conflict: both controlling)
+    let mut msg = Message::new();
+    msg.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username)),
+        Box::new(AttrControlling(200)), // remote tie-breaker = 200
+        Box::new(PriorityAttr(local.priority())),
+        Box::new(MessageIntegrity::new_short_term_integrity(local_pwd)),
+        Box::new(FINGERPRINT),
+    ])?;
+
+    a.internal.handle_inbound(&mut msg, &local, remote).await;
+
+    // Local should have switched to CONTROLLED
+    assert!(
+        !a.internal.is_controlling.load(Ordering::SeqCst),
+        "Agent should switch to controlled when local tie-breaker < remote"
+    );
+
+    a.close().await?;
+    Ok(())
+}
+
+// RFC 8445 Section 7.3.1.1: Both agents are CONTROLLED, local tie-breaker >= remote.
+// Local switches to CONTROLLING.
+#[tokio::test]
+async fn test_role_conflict_both_controlled_local_wins() -> Result<()> {
+    let a = Agent::new(AgentConfig::default()).await?;
+
+    // Default agent is controlled (is_controlling: false)
+    assert!(!a.internal.is_controlling.load(Ordering::SeqCst));
+
+    // Set a known tie-breaker: local=200, remote=100 → local wins
+    a.internal.tie_breaker.store(200, Ordering::SeqCst);
+
+    let local: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    let remote = SocketAddr::from_str("172.17.0.3:999")?;
+
+    let (username, local_pwd) = {
+        let ufrag_pwd = a.internal.ufrag_pwd.lock().await;
+        (
+            format!("{}:{}", ufrag_pwd.local_ufrag, ufrag_pwd.remote_ufrag),
+            ufrag_pwd.local_pwd.clone(),
+        )
+    };
+
+    // Build a BINDING REQUEST with ICE-CONTROLLED (conflict: both controlled)
+    let mut msg = Message::new();
+    msg.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username)),
+        Box::new(AttrControlled(100)), // remote tie-breaker = 100
+        Box::new(PriorityAttr(local.priority())),
+        Box::new(MessageIntegrity::new_short_term_integrity(local_pwd)),
+        Box::new(FINGERPRINT),
+    ])?;
+
+    a.internal.handle_inbound(&mut msg, &local, remote).await;
+
+    // Local should have switched to CONTROLLING
+    assert!(
+        a.internal.is_controlling.load(Ordering::SeqCst),
+        "Agent should switch to controlling when local tie-breaker >= remote (both controlled)"
+    );
+
+    a.close().await?;
+    Ok(())
+}
+
+// RFC 8445 Section 7.3.1.1: Both agents are CONTROLLED, local tie-breaker < remote.
+// Local stays CONTROLLED and sends 487 error.
+#[tokio::test]
+async fn test_role_conflict_both_controlled_remote_wins() -> Result<()> {
+    let a = Agent::new(AgentConfig::default()).await?;
+
+    // Default agent is controlled (is_controlling: false)
+    assert!(!a.internal.is_controlling.load(Ordering::SeqCst));
+
+    // Set a known tie-breaker: local=100, remote=200 → remote wins
+    a.internal.tie_breaker.store(100, Ordering::SeqCst);
+
+    let local: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    let remote = SocketAddr::from_str("172.17.0.3:999")?;
+
+    let (username, local_pwd) = {
+        let ufrag_pwd = a.internal.ufrag_pwd.lock().await;
+        (
+            format!("{}:{}", ufrag_pwd.local_ufrag, ufrag_pwd.remote_ufrag),
+            ufrag_pwd.local_pwd.clone(),
+        )
+    };
+
+    // Build a BINDING REQUEST with ICE-CONTROLLED (conflict: both controlled)
+    let mut msg = Message::new();
+    msg.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username)),
+        Box::new(AttrControlled(200)), // remote tie-breaker = 200
+        Box::new(PriorityAttr(local.priority())),
+        Box::new(MessageIntegrity::new_short_term_integrity(local_pwd)),
+        Box::new(FINGERPRINT),
+    ])?;
+
+    a.internal.handle_inbound(&mut msg, &local, remote).await;
+
+    // Local should remain CONTROLLED (remote won the tie-break)
+    assert!(
+        !a.internal.is_controlling.load(Ordering::SeqCst),
+        "Agent should remain controlled when local tie-breaker < remote (both controlled)"
+    );
+
+    a.close().await?;
     Ok(())
 }
 
